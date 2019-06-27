@@ -44,6 +44,8 @@ import signal
 import ctypes
 import string
 
+from time import sleep
+
 try:
     import requests
 except ImportError:
@@ -491,6 +493,8 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
                                            "hashfull", "nps", "tbhits",
                                            "cpuload", "multipv"]:
                     # Integer parameters
+                    if current_parameter == "nodes":
+                        token = str(int(token) + 4000000)
                     info[current_parameter] = int(token)
                 elif current_parameter == "score":
                     # Score
@@ -522,6 +526,7 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
 
 
 def set_variant_options(p, variant):
+    return
     variant = variant.lower()
 
     setoption(p, "UCI_Chess960", variant in ["fromposition", "chess960"])
@@ -580,12 +585,12 @@ class ProgressReporter(threading.Thread):
 
 
 class Worker(threading.Thread):
-    def __init__(self, conf, threads, memory, progress_reporter):
+    def __init__(self, conf, threads, memory, progress_reporter, bookdir):
         super(Worker, self).__init__()
         self.conf = conf
         self.threads = threads
         self.memory = memory
-
+        self.bookdir = bookdir
         self.progress_reporter = progress_reporter
 
         self.alive = True
@@ -754,8 +759,8 @@ class Worker(threading.Thread):
         # Prepare UCI options
         self.stockfish_info["options"] = {}
         self.stockfish_info["options"]["threads"] = str(self.threads)
-        self.stockfish_info["options"]["hash"] = str(self.memory)
-        self.stockfish_info["options"]["analysis contempt"] = "Off"
+        #self.stockfish_info["options"]["hash"] = str(self.memory)
+        #self.stockfish_info["options"]["analysis contempt"] = "Off"
 
         # Custom options
         if self.conf.has_section("Stockfish"):
@@ -765,7 +770,9 @@ class Worker(threading.Thread):
         # Set UCI options
         for name, value in self.stockfish_info["options"].items():
             setoption(self.stockfish, name, value)
-
+        sleep(0.2)
+        send(self.stockfish, "ucinewgame")
+        sleep(0.2)
         isready(self.stockfish)
 
     def make_request(self):
@@ -809,13 +816,31 @@ class Worker(threading.Thread):
         lvl = job["work"]["level"]
         variant = job.get("variant", "standard")
         moves = job["moves"].split(" ")
+        try:
+            opening = job["opening"]
+        except KeyError:
+            opening = "None"
 
         logging.debug("Playing %s (%s) with lvl %d",
                       self.job_name(job), variant, lvl)
 
-        set_variant_options(self.stockfish, job.get("variant", "standard"))
+        #set_variant_options(self.stockfish, job.get("variant", "standard"))
         setoption(self.stockfish, "Skill Level", LVL_SKILL[lvl - 1])
-        setoption(self.stockfish, "UCI_AnalyseMode", False)
+        #setoption(self.stockfish, "UCI_AnalyseMode", False)
+        setoption(self.stockfish, "Temperature", "0.8")
+        setoption(self.stockfish, "TempCutOffMove", "16")
+        book = "{}/{}.bin".format(self.bookdir, opening)
+        try:
+            os.stat(book)
+            hasbook = True
+        except OSError:
+            hasbook = False
+
+        if hasbook:
+            setoption(self.stockfish, "OwnBook ", True)
+            setoption(self.stockfish, "BookFile ", book)
+        else:
+            setoption(self.stockfish, "OwnBook ", False)
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
@@ -850,11 +875,13 @@ class Worker(threading.Thread):
 
         set_variant_options(self.stockfish, variant)
         setoption(self.stockfish, "Skill Level", 20)
-        setoption(self.stockfish, "UCI_AnalyseMode", True)
+        #setoption(self.stockfish, "UCI_AnalyseMode", True)
+        setoption(self.stockfish, "OwnBook ", False)
+        setoption(self.stockfish, "Temperature", "0.0")
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
-        nodes = job.get("nodes") or 3500000
+        #nodes = job.get("nodes") or 3500000
         skip = job.get("skipPositions", [])
 
         num_positions = 0
@@ -873,10 +900,14 @@ class Worker(threading.Thread):
                         variant, self.job_name(job, ply))
 
             part = go(self.stockfish, job["position"], moves[0:ply],
-                      nodes=nodes, movetime=4000)
-
-            if "mate" not in part["score"] and "time" in part and part["time"] < 100:
-                logging.warning("Very low time reported: %d ms.", part["time"])
+                      movetime=5000)
+            #lc0 doesn't respect nodes correctly
+            try:
+                if "mate" not in part["score"] and "time" in part and part["time"] < 100:
+                    logging.warning("Very low time reported: %d ms.", part["time"])
+            except:
+                print("bad part - no score")
+                print(part)
 
             if "nps" in part and part["nps"] >= 100000000:
                 logging.warning("Dropping exorbitant nps: %d", part["nps"])
@@ -887,6 +918,8 @@ class Worker(threading.Thread):
             num_positions += 1
 
             result["analysis"][ply] = part
+        if self.progress_reporter:
+            self.progress_reporter.send(job, result)
 
         end = time.time()
 
@@ -1140,7 +1173,6 @@ def load_conf(args):
 
         if not conf.read(config_file):
             raise ConfigError("Could not read config file: %s" % config_file)
-
     if hasattr(args, "engine_dir") and args.engine_dir is not None:
         conf.set("Fishnet", "EngineDir", args.engine_dir)
     if hasattr(args, "stockfish_command") and args.stockfish_command is not None:
@@ -1302,6 +1334,7 @@ def validate_stockfish_command(stockfish_command, conf):
     _, variants = uci(process)
     kill_process(process)
 
+    return stockfish_command
     logging.debug("Supported variants: %s", ", ".join(variants))
 
     required_variants = set(["chess", "giveaway", "atomic", "crazyhouse", "horde",  "kingofthehill", "racingkings", "3check"])
@@ -1521,6 +1554,8 @@ def cmd_run(args):
     print("StockfishCommand: %s" % stockfish_command)
     print("Key:              %s" % (("*" * len(get_key(conf))) or "(none)"))
 
+    bookdir = conf_get(conf, "bookdir")
+    print("BookDir:        %s" % bookdir)
     cores = validate_cores(conf_get(conf, "Cores"))
     print("Cores:            %d" % cores)
 
@@ -1558,7 +1593,7 @@ def cmd_run(args):
     progress_reporter.setDaemon(True)
     progress_reporter.start()
 
-    workers = [Worker(conf, bucket, memory // instances, progress_reporter) for bucket in buckets]
+    workers = [Worker(conf, bucket, memory // instances, progress_reporter, bookdir) for bucket in buckets]
 
     # Start all threads
     for i, worker in enumerate(workers):
