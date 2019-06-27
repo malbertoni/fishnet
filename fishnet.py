@@ -890,7 +890,6 @@ class Worker(threading.Thread):
             if ply in skip:
                 result["analysis"][ply] = {"skipped": True}
                 continue
-
             if last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
                 if self.progress_reporter:
                     self.progress_reporter.send(job, result)
@@ -900,7 +899,12 @@ class Worker(threading.Thread):
                         variant, self.job_name(job, ply))
 
             part = go(self.stockfish, job["position"], moves[0:ply],
-                      movetime=5000)
+                      movetime=4000)
+            if part['bestmove'] == "a1a1":
+                part['bestmove'] = None
+                part['depth'] = 0
+                part['score'] = {'mate': 0}
+
             #lc0 doesn't respect nodes correctly
             try:
                 if "mate" not in part["score"] and "time" in part and part["time"] < 100:
