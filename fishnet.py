@@ -43,6 +43,8 @@ import getpass
 import signal
 import ctypes
 import string
+import copy
+import datetime
 
 from time import sleep
 
@@ -117,8 +119,8 @@ PROGRESS_REPORT_INTERVAL = 5.0
 CHECK_PYPI_CHANCE = 0.01
 LVL_SKILL = [0, 3, 6, 10, 14, 16, 18, 20]
 LVL_MOVETIMES = [50, 100, 150, 200, 300, 400, 500, 1000]
-LVL_DEPTHS = [1, 1, 2, 3, 5, 6, 7, 8]
-
+LVL_DEPTHS = [2, 2, 3, 4, 6, 7, 8, 9]
+PAWN_VALUE_MG = 128
 
 def intro():
     return r"""
@@ -426,6 +428,136 @@ def setoption(p, name, value):
     send(p, "setoption name %s value %s" % (name, value))
 
 
+def get_skill_candidates(p, position, moves):
+    setoption(p, "MultiPv", "5")
+    send(p, "position fen %s moves %s" % (position, " ".join(moves)))
+    send(p, "go movetime 150")
+    response = parse_response(p)
+    logging.debug("multipv response: {}".format(response))
+    results = []
+    for i in range(1, 6):
+        if response.get(i) == None:
+            break
+        results.append(response[i]["pv"][0])
+    print("multipv results {}".format(results))
+    setoption(p, "MultiPv", "1")
+    candidates = []
+    for r in results:
+        newmoves = copy.deepcopy(moves)
+        newmoves.append(r)
+        print("position fen %s moves %s" % (position, " ".join(newmoves)))
+        send(p, "position fen %s moves %s" % (position, " ".join(newmoves)))
+        send(p, "go movetime 200")
+        response = parse_response(p)
+        logging.debug("{} response {}".format(r, response))
+        if not response.get("score"):
+            continue
+        cp = response["score"].get("cp")
+        if cp == None:
+            continue
+        if len(moves) % 2 == 1:
+            cp = -cp
+        candidates.append((r, cp))
+    candidates.sort(key=lambda (_, x): x)
+    return candidates
+
+def pick_best(p, position, moves, level):
+    candidates = get_skill_candidates(p, position, moves)
+    logging.debug("candidates: {}".format(candidates))
+    best = None
+    if len(candidates) < 2:
+        return best
+    random.seed(datetime.datetime.now().microsecond)
+    _, topScore = candidates[0]
+    _, worstScore = candidates[len(candidates)-1]
+    weakness = 100 - 2 * level
+    delta = min(topScore - worstScore, PAWN_VALUE_MG)
+    maxScore = -100000000
+    for c in candidates:
+        move, score = c
+        randval = random.uniform(0, weakness)
+        curdelta = topScore - score
+        push = (weakness*curdelta + delta * randval) / PAWN_VALUE_MG
+        if score + push >= maxScore:
+            maxScore = score + push
+            best = move
+    return best
+
+def parse_response(p):
+    response = {}
+    response["bestmove"] = None
+
+    while True:
+        command, arg = recv_uci(p)
+
+        if command == "bestmove":
+            bestmove = arg.split()[0]
+            if bestmove and bestmove != "(none)":
+                response["bestmove"] = bestmove
+            return response
+        elif command == "info":
+            arg = arg or ""
+            info = {}
+            # Parse all other parameters
+            score_kind, score_value, lowerbound, upperbound = None, None, False, False
+            current_parameter = None
+            for token in arg.split(" "):
+                if current_parameter == "string":
+                    # Everything until the end of line is a string
+                    if "string" in info:
+                        info["string"] += " " + token
+                    else:
+                        info["string"] = token
+                elif token == "score":
+                    current_parameter = "score"
+                elif token == "pv":
+                    current_parameter = "pv"
+                    info["pv"] = []
+                elif token in ["depth", "seldepth", "time", "nodes", "multipv",
+                               "currmove", "currmovenumber",
+                               "hashfull", "nps", "tbhits", "cpuload",
+                               "refutation", "currline", "string"]:
+                    current_parameter = token
+                    info.pop(current_parameter, None)
+                elif current_parameter in ["depth", "seldepth", "time",
+                                           "nodes", "currmovenumber",
+                                           "hashfull", "nps", "tbhits",
+                                           "cpuload", "multipv"]:
+                    # Integer parameters
+                    info[current_parameter] = int(token)
+                elif current_parameter == "score":
+                    # Score
+                    if token in ["cp", "mate"]:
+                        score_kind = token
+                        score_value = None
+                    elif token == "lowerbound":
+                        lowerbound = True
+                    elif token == "upperbound":
+                        upperbound = True
+                    else:
+                        score_value = int(token)
+                elif current_parameter == "pv":
+                    info["pv"].append(token)
+                else:
+                    # Strings
+                    if current_parameter in info:
+                        info[current_parameter] += " " + token
+                    else:
+                        info[current_parameter] = token
+            # Set score. Prefer scores that are not just a bound
+            if score_kind and score_value is not None and (not (lowerbound or upperbound) or "score" not in info or info["score"].get("lowerbound") or info["score"].get("upperbound")):
+                info["score"] = {score_kind: score_value}
+                if lowerbound:
+                    info["score"]["lowerbound"] = lowerbound
+                if upperbound:
+                    info["score"]["upperbound"] = upperbound
+            if info.get("multipv"):
+                response[info["multipv"]]  = info
+            else:
+                response = info
+        else:
+            logging.warning("Unexpected engine response to go: %s %s", command, arg)
+
 def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
     send(p, "position fen %s moves %s" % (position, " ".join(moves)))
 
@@ -680,7 +812,7 @@ class Worker(threading.Thread):
             if response.status_code == 204:
                 self.job = None
                 t = next(self.backoff)
-                logging.debug("No job found. Backing off %0.1fs", t)
+                #logging.debug("No job found. Backing off %0.1fs", t)
                 self.sleep.wait(t)
             elif response.status_code == 202:
                 logging.debug("Got job: %s", response.text)
@@ -825,7 +957,6 @@ class Worker(threading.Thread):
                       self.job_name(job), variant, lvl)
 
         #set_variant_options(self.stockfish, job.get("variant", "standard"))
-        setoption(self.stockfish, "Skill Level", LVL_SKILL[lvl - 1])
         #setoption(self.stockfish, "UCI_AnalyseMode", False)
         setoption(self.stockfish, "Temperature", "0.8")
         setoption(self.stockfish, "TempCutOffMove", "16")
@@ -845,13 +976,19 @@ class Worker(threading.Thread):
         isready(self.stockfish)
 
         movetime = int(round(LVL_MOVETIMES[lvl - 1] / (self.threads * 0.9 ** (self.threads - 1))))
-
+        skillLevel = LVL_SKILL[lvl-1]
         start = time.time()
         part = go(self.stockfish, job["position"], moves,
                   movetime=movetime, clock=job["work"].get("clock"),
                   depth=LVL_DEPTHS[lvl - 1])
-        end = time.time()
 
+        # check for less optimal move
+        if skillLevel < 20:
+            best = pick_best(self.stockfish, job["position"], moves, skillLevel)
+            if best:
+                part["bestmove"] = best
+
+        end = time.time()
         logging.log(PROGRESS, "Played move in %s (%s) with lvl %d: %0.3fs elapsed, depth %d",
                     self.job_name(job), variant,
                     lvl, end - start, part.get("depth", 0))
@@ -874,7 +1011,6 @@ class Worker(threading.Thread):
         start = last_progress_report = time.time()
 
         set_variant_options(self.stockfish, variant)
-        setoption(self.stockfish, "Skill Level", 20)
         #setoption(self.stockfish, "UCI_AnalyseMode", True)
         setoption(self.stockfish, "OwnBook ", False)
         setoption(self.stockfish, "Temperature", "0.0")
