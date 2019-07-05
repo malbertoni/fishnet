@@ -138,8 +138,10 @@ def intro():
 
 
 PROGRESS = 15
+SKILL = 12
 ENGINE = 5
 logging.addLevelName(PROGRESS, "PROGRESS")
+logging.addLevelName(SKILL, "SKILL")
 logging.addLevelName(ENGINE, "ENGINE")
 
 
@@ -239,10 +241,12 @@ def setup_logging(verbosity, stream=sys.stdout):
 
     handler = logging.StreamHandler(stream)
 
-    if verbosity >= 3:
+    if verbosity >= 4:
         handler.setLevel(ENGINE)
-    elif verbosity >= 2:
+    if verbosity >= 3:
         handler.setLevel(logging.DEBUG)
+    elif verbosity >= 2:
+        handler.setLevel(SKILL)
     elif verbosity >= 1:
         handler.setLevel(PROGRESS)
     else:
@@ -433,23 +437,23 @@ def get_skill_candidates(p, position, moves):
     send(p, "position fen %s moves %s" % (position, " ".join(moves)))
     send(p, "go movetime 150")
     response = parse_response(p)
-    logging.debug("multipv response: {}".format(response))
+    logging.log(SKILL, "multipv response: {}".format(response))
     results = []
     for i in range(1, 6):
         if response.get(i) == None:
             break
         results.append(response[i]["pv"][0])
-    print("multipv results {}".format(results))
+    logging.log(SKILL, "multipv results {}".format(results))
     setoption(p, "MultiPv", "1")
     candidates = []
     for r in results:
         newmoves = copy.deepcopy(moves)
         newmoves.append(r)
-        print("position fen %s moves %s" % (position, " ".join(newmoves)))
+        logging.log(SKILL, "position fen %s moves %s" % (position, " ".join(newmoves)))
         send(p, "position fen %s moves %s" % (position, " ".join(newmoves)))
         send(p, "go movetime 200")
         response = parse_response(p)
-        logging.debug("{} response {}".format(r, response))
+        logging.log(SKILL, "{} response {}".format(r, response))
         if not response.get("score"):
             continue
         cp = response["score"].get("cp")
@@ -458,19 +462,19 @@ def get_skill_candidates(p, position, moves):
         if len(moves) % 2 == 1:
             cp = -cp
         candidates.append((r, cp))
-    candidates.sort(key=lambda (_, x): x)
+    candidates.sort(key=lambda (_, x): x, reverse=True)
     return candidates
 
 def pick_best(p, position, moves, level):
     candidates = get_skill_candidates(p, position, moves)
-    logging.debug("candidates: {}".format(candidates))
+    logging.log(SKILL, "candidates: {}".format(candidates))
     best = None
     if len(candidates) < 2:
         return best
     random.seed(datetime.datetime.now().microsecond)
     _, topScore = candidates[0]
     _, worstScore = candidates[len(candidates)-1]
-    weakness = 100 - 2 * level
+    weakness = 120 - 2 * level
     delta = min(topScore - worstScore, PAWN_VALUE_MG)
     maxScore = -100000000
     for c in candidates:
@@ -478,9 +482,11 @@ def pick_best(p, position, moves, level):
         randval = random.uniform(0, weakness)
         curdelta = topScore - score
         push = (weakness*curdelta + delta * randval) / PAWN_VALUE_MG
+        logging.log(SKILL, "move: {} score: {} randval: {} curdelta: {} push: {} maxScore: {}".format(move, score, randval, curdelta, push, maxScore))
         if score + push >= maxScore:
             maxScore = score + push
             best = move
+    logging.log(SKILL, "picking best {} with score {}".format(best, maxScore))
     return best
 
 def parse_response(p):
@@ -797,7 +803,6 @@ class Worker(threading.Thread):
                 self.kill_stockfish()
 
             return
-
         try:
             # Report result and fetch next job
             response = self.http.post(get_endpoint(self.conf, path),
@@ -1046,8 +1051,8 @@ class Worker(threading.Thread):
                 if "mate" not in part["score"] and "time" in part and part["time"] < 100:
                     logging.warning("Very low time reported: %d ms.", part["time"])
             except:
-                print("bad part - no score")
-                print(part)
+                logging.log(SKILL, "bad part - no score")
+                logging.log(SKILL, part)
 
             if "nps" in part and part["nps"] >= 100000000:
                 logging.warning("Dropping exorbitant nps: %d", part["nps"])
