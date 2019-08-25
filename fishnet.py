@@ -459,8 +459,7 @@ def get_skill_candidates(p, position, moves):
         cp = response["score"].get("cp")
         if cp == None:
             continue
-        if len(moves) % 2 == 1:
-            cp = -cp
+        cp = -cp
         candidates.append((r, cp))
     candidates.sort(key=lambda (_, x): x, reverse=True)
     return candidates
